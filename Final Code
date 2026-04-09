@@ -1,0 +1,395 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# basic settings
+dt_hours = 0.5
+
+battery_capacity = 5.0
+max_charge = 2.5
+max_discharge = 2.5
+eta_ch = 0.95
+eta_dis = 0.95
+start_soc = 2.5
+cop = 3.0
+
+# file paths
+summer_file = r"C:\Users\rebec\OneDrive - King's College London\Energy\CA\Python Programme\caseA_smart_home_30min_summer.csv"
+winter_file = r"C:\Users\rebec\OneDrive - King's College London\Energy\CA\Python Programme\caseA_smart_home_30min_winter_optional.csv"
+
+# load data
+
+def load_data(file_name, heating=False):
+    df = pd.read_csv(file_name)
+
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    df["pv_kw"] = pd.to_numeric(df["pv_kw"], errors="coerce").fillna(0)
+    df["base_load_kw"] = pd.to_numeric(df["base_load_kw"], errors="coerce").fillna(0)
+    df["import_tariff"] = pd.to_numeric(df["import_tariff_gbp_per_kwh"], errors="coerce").fillna(0)
+    df["export_price"] = pd.to_numeric(df["export_price_gbp_per_kwh"], errors="coerce").fillna(0)
+    df["ambient_temp_C"] = pd.to_numeric(df["ambient_temp_C"], errors="coerce").fillna(0)
+
+    if heating == True:
+        df["heat_kw_thermal"] = pd.to_numeric(df["space_heat_demand_kw_th"], errors="coerce").fillna(0)
+        df["hp_electric_kw"] = df["heat_kw_thermal"] / cop
+    else:
+        df["heat_kw_thermal"] = 0
+        df["hp_electric_kw"] = 0
+
+    df["total_load_kw"] = df["base_load_kw"] + df["hp_electric_kw"]
+
+    return df
+
+# self consumption policy
+
+def run_self_consumption(data):
+    results = data.copy()
+
+    results["battery_charge_kw"] = 0.0
+    results["battery_discharge_kw"] = 0.0
+    results["grid_import_kw"] = 0.0
+    results["grid_export_kw"] = 0.0
+    results["soc_kwh"] = 0.0
+
+    soc = start_soc
+
+    for i in range(len(results)):
+        pv = results.loc[i, "pv_kw"]
+        load = results.loc[i, "total_load_kw"]
+
+        results.loc[i, "soc_kwh"] = soc
+
+        net = pv - load
+
+        if net >= 0:
+            room_left = (battery_capacity - soc) / (eta_ch * dt_hours)
+            charge = min(net, max_charge, max(room_left, 0))
+            export = net - charge
+
+            if export < 0:
+                export = 0
+
+            results.loc[i, "battery_charge_kw"] = charge
+            results.loc[i, "grid_export_kw"] = export
+
+            soc = soc + (eta_ch * charge * dt_hours)
+
+        else:
+            need = -net
+            available = soc * eta_dis / dt_hours
+            discharge = min(need, max_discharge, max(available, 0))
+            grid_import = need - discharge
+
+            if grid_import < 0:
+                grid_import = 0
+
+            results.loc[i, "battery_discharge_kw"] = discharge
+            results.loc[i, "grid_import_kw"] = grid_import
+
+            soc = soc - (discharge * dt_hours / eta_dis)
+
+        if soc < 0:
+            soc = 0
+        if soc > battery_capacity:
+            soc = battery_capacity
+
+    return results
+
+# tariff aware policy
+
+def run_tariff_policy(data):
+    results = data.copy()
+
+    results["battery_charge_kw"] = 0.0
+    results["battery_discharge_kw"] = 0.0
+    results["grid_import_kw"] = 0.0
+    results["grid_export_kw"] = 0.0
+    results["soc_kwh"] = 0.0
+
+    soc = start_soc
+
+    cheap_price = data["import_tariff"].quantile(0.35)
+    high_price = data["import_tariff"].quantile(0.70)
+
+    for i in range(len(results)):
+        pv = results.loc[i, "pv_kw"]
+        load = results.loc[i, "total_load_kw"]
+        tariff = results.loc[i, "import_tariff"]
+
+        results.loc[i, "soc_kwh"] = soc
+
+        net = pv - load
+
+        charge = 0
+        discharge = 0
+        grid_import = 0
+        grid_export = 0
+
+        if net >= 0:
+            room_left = (battery_capacity - soc) / (eta_ch * dt_hours)
+            charge = min(net, max_charge, max(room_left, 0))
+            grid_export = net - charge
+
+            if grid_export < 0:
+                grid_export = 0
+
+        else:
+            need = -net
+
+            if tariff >= high_price:
+                available = soc * eta_dis / dt_hours
+                discharge = min(need, max_discharge, max(available, 0))
+                need = need - discharge
+
+            if need < 0:
+                need = 0
+
+            grid_import = need
+
+            if tariff <= cheap_price and soc < 0.9 * battery_capacity:
+                room_left = (battery_capacity - soc) / (eta_ch * dt_hours)
+                extra_charge = min(max_charge - charge, max(room_left, 0))
+                charge = charge + extra_charge
+                grid_import = grid_import + extra_charge
+
+        soc = soc + (eta_ch * charge * dt_hours) - (discharge * dt_hours / eta_dis)
+
+        if soc < 0:
+            soc = 0
+        if soc > battery_capacity:
+            soc = battery_capacity
+
+        results.loc[i, "battery_charge_kw"] = charge
+        results.loc[i, "battery_discharge_kw"] = discharge
+        results.loc[i, "grid_import_kw"] = grid_import
+        results.loc[i, "grid_export_kw"] = grid_export
+
+    return results
+
+def add_columns(results):
+    results = results.copy()
+
+    results["pv_kwh"] = results["pv_kw"] * dt_hours
+    results["load_kwh"] = results["total_load_kw"] * dt_hours
+    results["import_kwh"] = results["grid_import_kw"] * dt_hours
+    results["export_kwh"] = results["grid_export_kw"] * dt_hours
+    results["charge_kwh"] = results["battery_charge_kw"] * dt_hours
+    results["discharge_kwh"] = results["battery_discharge_kw"] * dt_hours
+
+    results["import_cost_gbp"] = results["import_kwh"] * results["import_tariff"]
+    results["export_revenue_gbp"] = results["export_kwh"] * results["export_price"]
+    results["net_cost_gbp"] = results["import_cost_gbp"] - results["export_revenue_gbp"]
+
+    return results
+
+# summary
+
+def make_summary(results, name):
+    r = add_columns(results)
+
+    total_load = r["load_kwh"].sum()
+    total_pv = r["pv_kwh"].sum()
+    grid_import = r["import_kwh"].sum()
+    grid_export = r["export_kwh"].sum()
+    battery_charge = r["charge_kwh"].sum()
+    battery_discharge = r["discharge_kwh"].sum()
+    pv_used = total_pv - grid_export
+    import_cost = r["import_cost_gbp"].sum()
+    export_revenue = r["export_revenue_gbp"].sum()
+    net_cost = r["net_cost_gbp"].sum()
+
+    summary = {
+        "policy": name,
+        "total_load_kwh": total_load,
+        "total_pv_kwh": total_pv,
+        "grid_import_kwh": grid_import,
+        "grid_export_kwh": grid_export,
+        "battery_charge_kwh": battery_charge,
+        "battery_discharge_kwh": battery_discharge,
+        "pv_used_on_site_kwh": pv_used,
+        "import_cost_gbp": import_cost,
+        "export_revenue_gbp": export_revenue,
+        "net_cost_gbp": net_cost,
+        "final_soc_kwh": r["soc_kwh"].iloc[-1]
+    }
+
+    return summary
+
+# checks
+
+def print_checks(results, name):
+    print()
+    print(name)
+    print("-" * 40)
+
+    left = results["pv_kw"] + results["grid_import_kw"] + results["battery_discharge_kw"]
+    right = results["total_load_kw"] + results["battery_charge_kw"] + results["grid_export_kw"]
+    error = (left - right).abs().max()
+
+    print("Max power balance error:", round(error, 8))
+    print("Min SOC:", round(results["soc_kwh"].min(), 4))
+    print("Max SOC:", round(results["soc_kwh"].max(), 4))
+    print("Final SOC:", round(results["soc_kwh"].iloc[-1], 4))
+    print("Charge limit ok:", (results["battery_charge_kw"] <= max_charge + 1e-9).all())
+    print("Discharge limit ok:", (results["battery_discharge_kw"] <= max_discharge + 1e-9).all())
+    print("SOC in bounds:", ((results["soc_kwh"] >= 0) & (results["soc_kwh"] <= battery_capacity)).all())
+
+# plots
+
+def plot_soc(results1, results2, name1, name2, title):
+    plt.figure(figsize=(12, 4))
+    plt.plot(results1["timestamp"], results1["soc_kwh"], label=name1)
+    plt.plot(results2["timestamp"], results2["soc_kwh"], label=name2)
+    plt.axhline(start_soc, linestyle="--", label="start soc")
+    plt.title(title)
+    plt.xlabel("Time")
+    plt.ylabel("SOC (kWh)")
+    plt.legend()
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_daily_cost(results1, results2, name1, name2, title):
+    a = add_columns(results1)
+    b = add_columns(results2)
+
+    daily_a = a.groupby(a["timestamp"].dt.date)["net_cost_gbp"].sum()
+    daily_b = b.groupby(b["timestamp"].dt.date)["net_cost_gbp"].sum()
+
+    plt.figure(figsize=(12, 4))
+    plt.plot(daily_a.index, daily_a.values, marker="o", label=name1)
+    plt.plot(daily_b.index, daily_b.values, marker="o", label=name2)
+    plt.title(title)
+    plt.xlabel("Day")
+    plt.ylabel("Net cost (£)")
+    plt.legend()
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_sample(results, title, start_step=0, n_steps=96):
+    end_step = start_step + n_steps
+    r = results.iloc[start_step:end_step]
+
+    plt.figure(figsize=(12, 5))
+    plt.plot(r["timestamp"], r["pv_kw"], label="PV")
+    plt.plot(r["timestamp"], r["total_load_kw"], label="Load")
+    plt.plot(r["timestamp"], r["grid_import_kw"], label="Grid import")
+    plt.plot(r["timestamp"], r["grid_export_kw"], label="Grid export")
+    plt.plot(r["timestamp"], r["battery_charge_kw"], label="Battery charge")
+    plt.plot(r["timestamp"], r["battery_discharge_kw"], label="Battery discharge")
+    plt.title(title)
+    plt.xlabel("Time")
+    plt.ylabel("Power (kW)")
+    plt.legend()
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_energy_bars(summary_df, title):
+    summary_df = summary_df.set_index("policy")
+
+    cols = [
+        "total_load_kwh",
+        "total_pv_kwh",
+        "grid_import_kwh",
+        "grid_export_kwh",
+        "battery_charge_kwh",
+        "battery_discharge_kwh"
+    ]
+
+    summary_df[cols].plot(kind="bar", figsize=(12, 5))
+    plt.title(title)
+    plt.ylabel("Energy (kWh)")
+    plt.xticks(rotation=0)
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_cost_bars(summary_df, title):
+    summary_df = summary_df.set_index("policy")
+
+    cols = ["import_cost_gbp", "export_revenue_gbp", "net_cost_gbp"]
+
+    summary_df[cols].plot(kind="bar", figsize=(10, 5))
+    plt.title(title)
+    plt.ylabel("£")
+    plt.xticks(rotation=0)
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_heating(data, title):
+    plt.figure(figsize=(12, 4))
+    plt.plot(data["timestamp"], data["heat_kw_thermal"], label="Heating demand")
+    plt.plot(data["timestamp"], data["hp_electric_kw"], label="Heat pump electric")
+    plt.plot(data["timestamp"], data["total_load_kw"], label="Total load")
+    plt.title(title)
+    plt.xlabel("Time")
+    plt.ylabel("kW")
+    plt.legend()
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.show()
+
+# main program
+# summer
+summer_data = load_data(summer_file, heating=False)
+
+summer_self = run_self_consumption(summer_data)
+summer_tariff = run_tariff_policy(summer_data)
+
+summer_summary_1 = make_summary(summer_self, "self_consumption")
+summer_summary_2 = make_summary(summer_tariff, "tariff_aware")
+
+summer_summary = pd.DataFrame([summer_summary_1, summer_summary_2])
+
+print("SUMMER RESULTS")
+print(summer_summary.round(4).to_string(index=False))
+
+print_checks(summer_self, "Self consumption policy")
+print_checks(summer_tariff, "Tariff aware policy")
+
+plot_soc(summer_self, summer_tariff, "self_consumption", "tariff_aware", "Summer SOC comparison")
+plot_daily_cost(summer_self, summer_tariff, "self_consumption", "tariff_aware", "Summer daily net cost")
+plot_sample(summer_self, "Summer self consumption - first 2 days", 0, 96)
+plot_sample(summer_tariff, "Summer tariff aware - first 2 days", 0, 96)
+plot_energy_bars(summer_summary, "Summer energy comparison")
+plot_cost_bars(summer_summary, "Summer cost comparison")
+
+summer_self.to_csv("summer_self_results.csv", index=False)
+summer_tariff.to_csv("summer_tariff_results.csv", index=False)
+summer_summary.to_csv("summer_summary.csv", index=False)
+
+
+# winter
+winter_data = load_data(winter_file, heating=True)
+
+winter_self = run_self_consumption(winter_data)
+winter_tariff = run_tariff_policy(winter_data)
+
+winter_summary_1 = make_summary(winter_self, "winter_self")
+winter_summary_2 = make_summary(winter_tariff, "winter_tariff")
+
+winter_summary = pd.DataFrame([winter_summary_1, winter_summary_2])
+
+print()
+print("WINTER RESULTS")
+print(winter_summary.round(4).to_string(index=False))
+
+print_checks(winter_self, "Winter self consumption policy")
+print_checks(winter_tariff, "Winter tariff aware policy")
+
+plot_soc(winter_self, winter_tariff, "winter_self", "winter_tariff", "Winter SOC comparison")
+plot_daily_cost(winter_self, winter_tariff, "winter_self", "winter_tariff", "Winter daily net cost")
+plot_sample(winter_self, "Winter self consumption - first 2 days", 0, 96)
+plot_sample(winter_tariff, "Winter tariff aware - first 2 days", 0, 96)
+plot_energy_bars(winter_summary, "Winter energy comparison")
+plot_cost_bars(winter_summary, "Winter cost comparison")
+plot_heating(winter_data, "Winter heating extension")
+
+winter_self.to_csv("winter_self_results.csv", index=False)
+winter_tariff.to_csv("winter_tariff_results.csv", index=False)
+winter_summary.to_csv("winter_summary.csv", index=False)
